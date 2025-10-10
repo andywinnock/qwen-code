@@ -15,6 +15,7 @@ import type { OpenAICompatibleProvider } from './provider/index.js';
 import { OpenAIContentConverter } from './converter.js';
 import type { TelemetryService, RequestContext } from './telemetryService.js';
 import type { ErrorHandler } from './errorHandler.js';
+import { Qwen3StreamBuffer } from './qwen3-tool-parser.js';
 
 export interface PipelineConfig {
   cliConfig: Config;
@@ -81,12 +82,26 @@ export class ContentGenerationPipeline {
         )) as AsyncIterable<OpenAI.Chat.ChatCompletionChunk>;
 
         // Stage 2: Process stream with conversion and logging
-        return this.processStreamWithLogging(
-          stream,
-          context,
-          openaiRequest,
-          request,
-        );
+        // If tools are present, wrap stream with XML parser for Qwen3
+        const hasTools = request.config?.tools && request.config.tools.length > 0;
+
+        if (hasTools) {
+          // Use XML-aware stream processor for Qwen3 tool calls
+          return this.processStreamWithXmlToolParsing(
+            stream,
+            context,
+            openaiRequest,
+            request,
+          );
+        } else {
+          // Use standard stream processor
+          return this.processStreamWithLogging(
+            stream,
+            context,
+            openaiRequest,
+            request,
+          );
+        }
       },
     );
   }
@@ -158,6 +173,207 @@ export class ContentGenerationPipeline {
       }
 
       // Stage 2e: Stream completed successfully - perform logging with original OpenAI chunks
+      context.duration = Date.now() - context.startTime;
+
+      await this.config.telemetryService.logStreamingSuccess(
+        context,
+        collectedGeminiResponses,
+        openaiRequest,
+        collectedOpenAIChunks,
+      );
+    } catch (error) {
+      // Clear streaming tool calls on error to prevent data pollution
+      this.converter.resetStreamingToolCalls();
+
+      // Use shared error handling logic
+      await this.handleError(error, context, request);
+    }
+  }
+
+  /**
+   * Process OpenAI stream with XML tool call parsing for Qwen3
+   * This method intercepts content chunks and parses XML tool calls client-side
+   */
+  private async *processStreamWithXmlToolParsing(
+    stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>,
+    context: RequestContext,
+    openaiRequest: OpenAI.Chat.ChatCompletionCreateParams,
+    request: GenerateContentParameters,
+  ): AsyncGenerator<GenerateContentResponse> {
+    const collectedGeminiResponses: GenerateContentResponse[] = [];
+    const collectedOpenAIChunks: OpenAI.Chat.ChatCompletionChunk[] = [];
+    const xmlBuffer = new Qwen3StreamBuffer();
+
+    // Reset streaming tool calls to prevent data pollution from previous streams
+    this.converter.resetStreamingToolCalls();
+
+    // State for handling chunk merging
+    let pendingFinishResponse: GenerateContentResponse | null = null;
+
+    try {
+      for await (const chunk of stream) {
+        collectedOpenAIChunks.push(chunk);
+
+        // Extract text content from chunk
+        const textDelta = chunk.choices?.[0]?.delta?.content;
+
+        if (textDelta) {
+          // Check for XML tool calls in the text delta
+          const newToolCalls = xmlBuffer.addChunk(textDelta);
+
+          // If we found completed tool calls, convert to OpenAI format
+          if (newToolCalls.length > 0) {
+            console.log('[qwen3-xml] Parsed tool calls:', newToolCalls.map(tc => tc.function.name));
+
+            // Create synthetic OpenAI chunks with tool_calls
+            for (const toolCall of newToolCalls) {
+              const toolCallChunk: OpenAI.Chat.ChatCompletionChunk = {
+                id: chunk.id,
+                object: 'chat.completion.chunk',
+                created: chunk.created,
+                model: chunk.model,
+                choices: [{
+                  index: 0,
+                  delta: {
+                    tool_calls: [{
+                      index: 0,
+                      id: toolCall.id,
+                      type: 'function',
+                      function: {
+                        name: toolCall.function.name,
+                        arguments: toolCall.function.arguments
+                      }
+                    }]
+                  },
+                  finish_reason: null,
+                  logprobs: null
+                }]
+              };
+
+              const response = this.converter.convertOpenAIChunkToGemini(toolCallChunk);
+
+              if (
+                response.candidates?.[0]?.content?.parts?.length === 0 &&
+                !response.candidates?.[0]?.finishReason &&
+                !response.usageMetadata
+              ) {
+                continue;
+              }
+
+              const shouldYield = this.handleChunkMerging(
+                response,
+                collectedGeminiResponses,
+                (mergedResponse) => {
+                  pendingFinishResponse = mergedResponse;
+                },
+              );
+
+              if (shouldYield) {
+                if (pendingFinishResponse) {
+                  yield pendingFinishResponse;
+                  pendingFinishResponse = null;
+                } else {
+                  yield response;
+                }
+              }
+            }
+
+            // Don't emit text while in tool call
+            if (xmlBuffer.isInToolCall()) {
+              continue;
+            }
+
+            // Emit cleaned text (XML stripped)
+            const cleanedText = xmlBuffer.getTextContent();
+            if (cleanedText.length > 0) {
+              const cleanedChunk: OpenAI.Chat.ChatCompletionChunk = {
+                ...chunk,
+                choices: [{
+                  ...chunk.choices[0],
+                  delta: {
+                    content: cleanedText
+                  }
+                }]
+              };
+
+              const response = this.converter.convertOpenAIChunkToGemini(cleanedChunk);
+              collectedGeminiResponses.push(response);
+              yield response;
+              xmlBuffer.reset();
+            }
+          } else if (!xmlBuffer.isInToolCall()) {
+            // No tool calls detected, pass through original chunk
+            const response = this.converter.convertOpenAIChunkToGemini(chunk);
+
+            if (
+              response.candidates?.[0]?.content?.parts?.length === 0 &&
+              !response.candidates?.[0]?.finishReason &&
+              !response.usageMetadata
+            ) {
+              continue;
+            }
+
+            const shouldYield = this.handleChunkMerging(
+              response,
+              collectedGeminiResponses,
+              (mergedResponse) => {
+                pendingFinishResponse = mergedResponse;
+              },
+            );
+
+            if (shouldYield) {
+              if (pendingFinishResponse) {
+                yield pendingFinishResponse;
+                pendingFinishResponse = null;
+              } else {
+                yield response;
+              }
+            }
+          }
+          // If in tool call, buffer it (don't emit yet)
+        } else {
+          // Pass through other chunk types (finish, error, etc)
+          const response = this.converter.convertOpenAIChunkToGemini(chunk);
+
+          if (
+            response.candidates?.[0]?.content?.parts?.length === 0 &&
+            !response.candidates?.[0]?.finishReason &&
+            !response.usageMetadata
+          ) {
+            continue;
+          }
+
+          const shouldYield = this.handleChunkMerging(
+            response,
+            collectedGeminiResponses,
+            (mergedResponse) => {
+              pendingFinishResponse = mergedResponse;
+            },
+          );
+
+          if (shouldYield) {
+            if (pendingFinishResponse) {
+              yield pendingFinishResponse;
+              pendingFinishResponse = null;
+            } else {
+              yield response;
+            }
+          }
+        }
+      }
+
+      // After stream ends, emit any final completed tool calls
+      const finalToolCalls = xmlBuffer.getCompletedToolCalls();
+      if (finalToolCalls.length > 0) {
+        console.log('[qwen3-xml] Final tool calls from stream:', finalToolCalls.length);
+      }
+
+      // If there's still a pending finish response at the end, yield it
+      if (pendingFinishResponse) {
+        yield pendingFinishResponse;
+      }
+
+      // Stream completed successfully - perform logging
       context.duration = Date.now() - context.startTime;
 
       await this.config.telemetryService.logStreamingSuccess(
