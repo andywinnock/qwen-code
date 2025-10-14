@@ -85,6 +85,7 @@ export interface ToolCallRequestInfo {
   args: Record<string, unknown>;
   isClientInitiated: boolean;
   prompt_id: string;
+  response_id?: string;
 }
 
 export interface ToolCallResponseInfo {
@@ -203,6 +204,7 @@ export class Turn {
   readonly pendingToolCalls: ToolCallRequestInfo[];
   private debugResponses: GenerateContentResponse[];
   finishReason: FinishReason | undefined;
+  private currentResponseId?: string;
 
   constructor(
     private readonly chat: GeminiChat,
@@ -247,6 +249,11 @@ export class Turn {
         if (!resp) continue; // Skip if there's no response body
 
         this.debugResponses.push(resp);
+
+        // Track the current response ID for tool call correlation
+        if (resp.responseId) {
+          this.currentResponseId = resp.responseId;
+        }
 
         const thoughtPart = resp.candidates?.[0]?.content?.parts?.[0];
         if (thoughtPart?.thought) {
@@ -347,6 +354,7 @@ export class Turn {
       args,
       isClientInitiated: false,
       prompt_id: this.prompt_id,
+      response_id: this.currentResponseId,
     };
 
     this.pendingToolCalls.push(toolCallRequest);
