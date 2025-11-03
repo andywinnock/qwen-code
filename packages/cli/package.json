@@ -1,6 +1,6 @@
 {
   "name": "@qwen-code/qwen-code",
-  "version": "0.1.3",
+  "version": "0.1.3-loop-fix",
   "description": "Qwen Code",
   "repository": {
     "type": "git",
