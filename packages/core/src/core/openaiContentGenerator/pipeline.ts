@@ -89,7 +89,8 @@ export class ContentGenerationPipeline {
 
         // Stage 2: Process stream with conversion and logging
         // If tools are present, wrap stream with XML parser for Qwen3
-        const hasTools = request.config?.tools && request.config.tools.length > 0;
+        const hasTools =
+          request.config?.tools && request.config.tools.length > 0;
 
         if (hasTools) {
           // Use XML-aware stream processor for Qwen3 tool calls
@@ -229,7 +230,10 @@ export class ContentGenerationPipeline {
 
           // If we found completed tool calls, convert to OpenAI format
           if (newToolCalls.length > 0) {
-            console.log('[qwen3-xml] Parsed tool calls:', newToolCalls.map(tc => tc.function.name));
+            console.log(
+              '[qwen3-xml] Parsed tool calls:',
+              newToolCalls.map((tc) => tc.function.name),
+            );
 
             // Create synthetic OpenAI chunks with tool_calls
             for (const toolCall of newToolCalls) {
@@ -238,25 +242,30 @@ export class ContentGenerationPipeline {
                 object: 'chat.completion.chunk',
                 created: chunk.created,
                 model: chunk.model,
-                choices: [{
-                  index: 0,
-                  delta: {
-                    tool_calls: [{
-                      index: 0,
-                      id: toolCall.id,
-                      type: 'function',
-                      function: {
-                        name: toolCall.function.name,
-                        arguments: toolCall.function.arguments
-                      }
-                    }]
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: toolCall.id,
+                          type: 'function',
+                          function: {
+                            name: toolCall.function.name,
+                            arguments: toolCall.function.arguments,
+                          },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                    logprobs: null,
                   },
-                  finish_reason: null,
-                  logprobs: null
-                }]
+                ],
               };
 
-              const response = this.converter.convertOpenAIChunkToGemini(toolCallChunk);
+              const response =
+                this.converter.convertOpenAIChunkToGemini(toolCallChunk);
 
               if (
                 response.candidates?.[0]?.content?.parts?.length === 0 &&
@@ -294,15 +303,18 @@ export class ContentGenerationPipeline {
             if (cleanedText.length > 0) {
               const cleanedChunk: OpenAI.Chat.ChatCompletionChunk = {
                 ...chunk,
-                choices: [{
-                  ...chunk.choices[0],
-                  delta: {
-                    content: cleanedText
-                  }
-                }]
+                choices: [
+                  {
+                    ...chunk.choices[0],
+                    delta: {
+                      content: cleanedText,
+                    },
+                  },
+                ],
               };
 
-              const response = this.converter.convertOpenAIChunkToGemini(cleanedChunk);
+              const response =
+                this.converter.convertOpenAIChunkToGemini(cleanedChunk);
               collectedGeminiResponses.push(response);
               yield response;
               xmlBuffer.reset();
@@ -371,7 +383,10 @@ export class ContentGenerationPipeline {
       // After stream ends, emit any final completed tool calls
       const finalToolCalls = xmlBuffer.getCompletedToolCalls();
       if (finalToolCalls.length > 0) {
-        console.log('[qwen3-xml] Final tool calls from stream:', finalToolCalls.length);
+        console.log(
+          '[qwen3-xml] Final tool calls from stream:',
+          finalToolCalls.length,
+        );
       }
 
       // If there's still a pending finish response at the end, yield it
@@ -490,15 +505,10 @@ export class ContentGenerationPipeline {
         request.config.tools,
       );
 
-      // Add stop sequences to prevent infinite loops with XML tool calling format
-      // These stop tokens match the XML format from qwen-strict-tool-template.jinja
-      baseRequest.stop = [
-        '<tool_call>',
-        '</tool_call>',
-        '</function>',
-        '</parameter>',
-        '<|im_end|>',
-      ];
+      // Note: Stop sequences removed to allow tool calls to complete
+      // Server-side repetition penalties prevent infinite loops:
+      //   --repeat-penalty 1.1
+      //   --frequency-penalty 0.5
     }
 
     // Let provider enhance the request (e.g., add metadata, cache control)
