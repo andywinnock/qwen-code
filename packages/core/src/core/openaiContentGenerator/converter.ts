@@ -22,6 +22,10 @@ import { GenerateContentResponse, FinishReason } from '@google/genai';
 import type OpenAI from 'openai';
 import { safeJsonParse } from '../../utils/safeJsonParse.js';
 import { StreamingToolCallParser } from './streamingToolCallParser.js';
+import {
+  filterIncompleteXMLToolCalls,
+  detectToolCallLoop,
+} from '../../utils/xmlToolCallFilter.js';
 
 /**
  * Tool call accumulator for streaming responses
@@ -621,7 +625,22 @@ export class OpenAIContentConverter {
       // Handle text content
       if (choice.delta?.content) {
         if (typeof choice.delta.content === 'string') {
-          parts.push({ text: choice.delta.content });
+          // Filter out incomplete XML tool call tags to prevent display leaks
+          const filteredContent = filterIncompleteXMLToolCalls(
+            choice.delta.content,
+          );
+
+          // Only add non-empty content to parts
+          if (filteredContent.length > 0) {
+            parts.push({ text: filteredContent });
+          }
+
+          // Detect infinite loops (e.g., repeated <function=read_file> tags)
+          if (detectToolCallLoop(choice.delta.content)) {
+            console.warn(
+              'Warning: Possible infinite tool call loop detected. Content may be repetitive.',
+            );
+          }
         }
       }
 

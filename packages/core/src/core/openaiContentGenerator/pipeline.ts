@@ -489,6 +489,16 @@ export class ContentGenerationPipeline {
       baseRequest.tools = await this.converter.convertGeminiToolsToOpenAI(
         request.config.tools,
       );
+
+      // Add stop sequences to prevent infinite loops with XML tool calling format
+      // These stop tokens match the XML format from qwen-strict-tool-template.jinja
+      baseRequest.stop = [
+        '<tool_call>',
+        '</tool_call>',
+        '</function>',
+        '</parameter>',
+        '<|im_end|>',
+      ];
     }
 
     // Let provider enhance the request (e.g., add metadata, cache control)
